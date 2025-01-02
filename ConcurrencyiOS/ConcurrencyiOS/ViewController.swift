@@ -6,30 +6,286 @@
 //
 
 import UIKit
+import MetalKit
+import Vision
+import AVFoundation
+import CoreImage
 
-class ViewController: UIViewController {
+class MLMetalViewController: UIViewController {
+    private var metalView: MTKView!
+    private var device: MTLDevice!
+    private var commandQueue: MTLCommandQueue!
+    private var pipelineState: MTLRenderPipelineState!
+    private var captureSession: AVCaptureSession!
+    private var videoOutput: AVCaptureVideoDataOutput!
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        
-        let label = "com.raywenderlich.mycoolapp.networking"
-        let queue = DispatchQueue(label: label, attributes: .concurrent)
+    // ML Properties
+    private var detectionRequest: VNCoreMLRequest!
+    private var visionModel: VNCoreMLModel!
+    private var detectedObjects: [VNRecognizedObjectObservation] = []
+    private var vertexBuffer: MTLBuffer!
+    private var texture: MTLTexture?
+    private var samplerState: MTLSamplerState!
+    private var textureCache: CVMetalTextureCache?
 
-        // .userinteractive QoS is recommended for tasks that the user directly interacts with. UI-updating calculations, animations or anything needed to keep the UI responsive and fast
-        let queue_userInteractive = DispatchQueue.global(qos: .userInteractive)
-
-        //userInitiated queue should be used when the user kicks off a task from the UI that needs to happen immediately, but can be done asynchronously. For example, you may need to open a document or read from a local database
-        let queue_userInitiated = DispatchQueue.global(qos: .userInitiated)
-
-        //.utility dispatch queue for tasks that would typically include a progress indicator such as long-running computations, I/O, networking or continuous data feeds
-        let queue_utility = DispatchQueue.global(qos: .utility)
-
-        //For tasks that the user is not directly aware of you should use the .background queue. They don’t require user interaction and aren’t time sensitive. Prefetching, database maintenance, synchronizing remote servers and performing backups are all great examples.
-        let queue_background = DispatchQueue.global(qos: .background)
+    // Vertices for a full-screen quad
+    private let vertices: [Float] = [
+        -1.0, -1.0, 0.0, 1.0,
+         1.0, -1.0, 0.0, 1.0,
+        -1.0,  1.0, 0.0, 1.0,
+         1.0,  1.0, 0.0, 1.0,
+    ]
 
 
+
+    // Uniform buffer for passing detection data to Metal
+    struct Uniforms {
+        var numObjects: UInt32
+        var padding: SIMD3<UInt32>
+        var objectBoxes: [SIMD4<Float>]
+
+        init() {
+            numObjects = 0
+            padding = SIMD3<UInt32>(0, 0, 0)
+            objectBoxes = Array(repeating: SIMD4<Float>(0, 0, 0, 0), count: 20)
+        }
     }
 
 
+    private var uniformBuffer: MTLBuffer!
+    private var uniforms = Uniforms()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupMetal()
+        setupTextureCache() // Add this new setup
+        setupML()
+        setupCamera()
+        setupView()
+        setupPipeline()
+        setupSamplerState()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        captureSession.startRunning()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        captureSession.stopRunning()
+    }
+
+    private func setupMetal() {
+        device = MTLCreateSystemDefaultDevice()
+        guard device != nil else {
+            fatalError("Metal is not supported")
+        }
+
+        commandQueue = device.makeCommandQueue()
+        uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride,
+                                        options: .storageModeShared)
+    }
+
+    private func setupML() {
+        // Load YOLO or MobileNet model
+        guard let modelURL = Bundle.main.url(forResource: "YOLOv3", withExtension: "mlmodelc"),
+              let model = try? VNCoreMLModel(for: MLModel(contentsOf: modelURL)) else {
+            fatalError("Failed to load ML model")
+        }
+
+        visionModel = model
+        detectionRequest = VNCoreMLRequest(model: visionModel) { [weak self] request, error in
+            self?.processDetections(request.results as? [VNRecognizedObjectObservation] ?? [])
+        }
+        detectionRequest.imageCropAndScaleOption = .scaleFit
+    }
+
+    private func setupCamera() {
+        captureSession = AVCaptureSession()
+        captureSession.sessionPreset = .hd1280x720
+
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+              let input = try? AVCaptureDeviceInput(device: device) else {
+            fatalError("Failed to setup camera")
+        }
+
+        videoOutput = AVCaptureVideoDataOutput()
+        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
+        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+
+        captureSession.addInput(input)
+        captureSession.addOutput(videoOutput)
+
+        DispatchQueue.global(qos: .background).async {
+            self.captureSession.startRunning()
+        }
+    }
+
+    private func processDetections(_ observations: [VNRecognizedObjectObservation]) {
+        uniforms.numObjects = UInt32(min(observations.count, 20))
+
+        for (index, observation) in observations.prefix(20).enumerated() {
+            let bbox = observation.boundingBox
+            uniforms.objectBoxes[index] = SIMD4<Float>(
+                Float(bbox.origin.x),
+                Float(bbox.origin.y),
+                Float(bbox.size.width),
+                Float(bbox.size.height)
+            )
+        }
+
+        // Copy uniforms to the buffer
+        guard let contents = uniformBuffer?.contents() else { return }
+        memcpy(contents, &uniforms, MemoryLayout<Uniforms>.stride)
+    }
+    private func setupView() {
+        metalView = MTKView(frame: view.bounds, device: device)
+        metalView.delegate = self
+        metalView.framebufferOnly = false
+        metalView.colorPixelFormat = .bgra8Unorm
+        metalView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        view.addSubview(metalView)
+
+        // Set up vertex buffer
+        vertexBuffer = device.makeBuffer(bytes: vertices,
+                                       length: vertices.count * MemoryLayout<Float>.stride,
+                                       options: [])
+    }
+
+    private func setupPipeline() {
+        guard let library = device.makeDefaultLibrary() else {
+            fatalError("Failed to create default library")
+        }
+
+        // Create pipeline descriptor
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+
+        // Configure vertex function
+        guard let vertexFunction = library.makeFunction(name: "vertexShader") else {
+            fatalError("Failed to create vertex function")
+        }
+        pipelineDescriptor.vertexFunction = vertexFunction
+
+        // Configure fragment function
+        guard let fragmentFunction = library.makeFunction(name: "fragmentShader") else {
+            fatalError("Failed to create fragment function")
+        }
+        pipelineDescriptor.fragmentFunction = fragmentFunction
+
+        // Configure color attachment
+        pipelineDescriptor.colorAttachments[0].pixelFormat = metalView.colorPixelFormat
+
+        // Create pipeline state
+        do {
+            pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        } catch {
+            fatalError("Failed to create pipeline state: \(error)")
+        }
+    }
+
+    private func setupTextureCache() {
+           var cache: CVMetalTextureCache?
+           CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+           textureCache = cache
+       }
+
+       private func createTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
+           let width = CVPixelBufferGetWidth(pixelBuffer)
+           let height = CVPixelBufferGetHeight(pixelBuffer)
+
+           var textureRef: CVMetalTexture?
+           let result = CVMetalTextureCacheCreateTextureFromImage(
+               nil,
+               textureCache!,
+               pixelBuffer,
+               nil,
+               .bgra8Unorm,
+               width,
+               height,
+               0,
+               &textureRef
+           )
+
+           guard result == kCVReturnSuccess,
+                 let texture = textureRef,
+                 let metalTexture = CVMetalTextureGetTexture(texture) else {
+               return nil
+           }
+
+           return metalTexture
+       }
+
+    private func setupSamplerState() {
+        let samplerDescriptor = MTLSamplerDescriptor()
+        samplerDescriptor.minFilter = .linear
+        samplerDescriptor.magFilter = .linear
+        samplerDescriptor.sAddressMode = .clampToEdge
+        samplerDescriptor.tAddressMode = .clampToEdge
+        samplerState = device.makeSamplerState(descriptor: samplerDescriptor)
+    }
+
+}
+
+// Add MTKViewDelegate conformance
+extension MLMetalViewController: MTKViewDelegate {
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        // Handle resize if needed
+    }
+
+    func draw(in view: MTKView) {
+        guard let drawable = view.currentDrawable,
+              let renderPassDescriptor = view.currentRenderPassDescriptor,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        // Set the render pipeline state
+        renderEncoder.setRenderPipelineState(pipelineState)
+
+        // Set the vertex buffer
+        renderEncoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+
+        // Set the uniforms
+        renderEncoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 1)
+
+        // Set the texture and sampler state
+        if let texture = texture {
+            renderEncoder.setFragmentTexture(texture, index: 0)
+            renderEncoder.setFragmentSamplerState(samplerState, index: 0)
+        }
+
+        // Draw the quad
+        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+
+        // End encoding and commit
+        renderEncoder.endEncoding()
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+}
+
+// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+extension MLMetalViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput,
+                      didOutput sampleBuffer: CMSampleBuffer,
+                      from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Create texture from camera frame
+        if let newTexture = createTexture(from: pixelBuffer) {
+            texture = newTexture
+        }
+
+        // Perform ML detection
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        try? handler.perform([detectionRequest])
+
+        // Update Metal view for rendering
+        DispatchQueue.main.async { [weak self] in
+            self?.metalView.draw()
+        }
+    }
 }
 

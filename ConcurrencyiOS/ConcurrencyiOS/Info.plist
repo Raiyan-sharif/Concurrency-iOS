@@ -17,6 +17,8 @@
 					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
 					<key>UISceneStoryboardFile</key>
 					<string>Main</string>
+					<key>NSCameraUsageDescription</key>
+					<string>Camera access is required for ML processing</string>
 				</dict>
 			</array>
 		</dict>
